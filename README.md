@@ -1,4 +1,4 @@
-# INNOVILLAGE MICROCONTROLLER PAGE
+# INNOVILLAGE MICROCONTROLLER
 This project is an ESP32-based solution for monitoring water quality parameters (pH, ORP, TDS, Temperature) via a Tuya smart device and controlling an 8-channel relay module. It features real-time data visualization on an LCD, WiFi provisioning via a captive portal, and data synchronization with a backend server.
 
 ## 🌟 Features
