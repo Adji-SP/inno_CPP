@@ -13,8 +13,8 @@
 char tuya_id[40] = "a3658e534d4fad4173ijbi";
 char tuya_key[40] = "jBM'#B$OGU/aN_Ud";
 char tuya_ip[20] = "192.168.223.41";
-char api_url[80] = "http://192.168.1.10:8000";       // Base API URL
-char time_url[80] = "http://192.168.1.10:8000/time"; // New: Time API URL
+char api_url[80] = "http://192.168.1.10:8000";      
+char time_url[80] = "http://192.168.1.10:8000/time";
 const float VER = 3.3f;
 
 // ===== HARDWARE =====
@@ -152,8 +152,7 @@ void syncTime()
 
 void sendData(SensorData &d)
 {
-  if (WiFi.status() != WL_CONNECTED)
-    return;
+  if (WiFi.status() != WL_CONNECTED) return;
 
   DateTime now = rtc.now();
   char ts[25];
@@ -173,8 +172,7 @@ void sendData(SensorData &d)
 
 int getCmd(int id)
 {
-  if (WiFi.status() != WL_CONNECTED)
-    return -1;
+  if (WiFi.status() != WL_CONNECTED) return -1;
   http.begin(String(api_url) + "/fetch/" + String(id) + "/state");
   http.setTimeout(150);
   int code = http.GET();
