@@ -4,15 +4,17 @@
 #include <WiFiManager.h>
 #include <Preferences.h>
 #include <Wire.h>
-#include <LiquidCrystal_I2C.h> // Lib: LiquidCrystal_I2C
-#include <RTClib.h>            // Lib: RTClib (Adafruit)
+#include <LiquidCrystal_I2C.h>
+#include <RTClib.h>
+#include <ArduinoJson.h> // Ensure ArduinoJson is included
 #include "TuyaDevice.h"
 
 // ===== DEFAULTS =====
 char tuya_id[40] = "a3658e534d4fad4173ijbi";
 char tuya_key[40] = "jBM'#B$OGU/aN_Ud";
 char tuya_ip[20] = "192.168.223.41";
-char api_url[60] = "http://192.168.1.10:8000";
+char api_url[80] = "http://192.168.1.10:8000";       // Base API URL
+char time_url[80] = "http://192.168.1.10:8000/time"; // New: Time API URL
 const float VER = 3.3f;
 
 // ===== HARDWARE =====
@@ -20,7 +22,7 @@ const int RELAY_CNT = 8;
 const int R_IDS[RELAY_CNT] = {2, 3, 4, 5, 6, 7, 8, 9};
 const int R_PINS[RELAY_CNT] = {27, 26, 25, 33, 19, 18, 17, 16};
 
-// Track relay states to detect changes for LCD
+// Track relay states
 int last_r_state[RELAY_CNT];
 
 // ===== OBJECTS =====
@@ -29,12 +31,13 @@ HTTPClient http;
 Preferences prefs;
 bool shouldSave = false;
 RTC_DS3231 rtc;
-LiquidCrystal_I2C lcd(0x27, 16, 2); // Address 0x27 is standard
+JsonDocument doc; // ArduinoJson v7
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // ===== LCD STATE =====
 bool showRelayMsg = false;
 unsigned long msgStartTime = 0;
-const unsigned long MSG_DURATION = 3000; // Show relay msg for 3s
+const unsigned long MSG_DURATION = 3000;
 String relayLine1 = "";
 String relayLine2 = "";
 
@@ -69,21 +72,25 @@ void setupWiFi()
   String s_key = prefs.getString("key", tuya_key);
   String s_ip = prefs.getString("ip", tuya_ip);
   String s_url = prefs.getString("url", api_url);
+  String s_time = prefs.getString("time", time_url); // Load Time URL
 
   s_id.toCharArray(tuya_id, 40);
   s_key.toCharArray(tuya_key, 40);
   s_ip.toCharArray(tuya_ip, 20);
-  s_url.toCharArray(api_url, 60);
+  s_url.toCharArray(api_url, 80);
+  s_time.toCharArray(time_url, 80);
 
   WiFiManagerParameter p_id("id", "Device ID", tuya_id, 40);
   WiFiManagerParameter p_key("key", "Local Key", tuya_key, 40);
   WiFiManagerParameter p_ip("ip", "Tuya IP", tuya_ip, 20);
-  WiFiManagerParameter p_url("url", "API URL", api_url, 60);
+  WiFiManagerParameter p_url("url", "API Base URL", api_url, 80);
+  WiFiManagerParameter p_time("time", "Time API URL", time_url, 80); // New Field
 
   wm.addParameter(&p_id);
   wm.addParameter(&p_key);
   wm.addParameter(&p_ip);
   wm.addParameter(&p_url);
+  wm.addParameter(&p_time);
 
   if (!wm.autoConnect("ESP32_Config"))
     ESP.restart();
@@ -94,19 +101,60 @@ void setupWiFi()
     strcpy(tuya_key, p_key.getValue());
     strcpy(tuya_ip, p_ip.getValue());
     strcpy(api_url, p_url.getValue());
+    strcpy(time_url, p_time.getValue());
+
     prefs.putString("id", tuya_id);
     prefs.putString("key", tuya_key);
     prefs.putString("ip", tuya_ip);
     prefs.putString("url", api_url);
+    prefs.putString("time", time_url);
     prefs.end();
   }
 }
 
+void syncTime()
+{
+  if (WiFi.status() != WL_CONNECTED)
+    return;
+
+  Serial.print("Syncing Time from: ");
+  Serial.println(time_url);
+  http.begin(time_url);
+  int code = http.GET();
+
+  if (code == 200)
+  {
+    String payload = http.getString();
+    deserializeJson(doc, payload);
+
+    // Expects format: {"timestamp": 1709999999}
+    long ts = doc["timestamp"];
+
+    if (ts > 1000000000)
+    { // Basic validity check
+      rtc.adjust(DateTime(ts));
+      Serial.printf("RTC Synced! Unix: %ld\n", ts);
+      lcd.clear();
+      lcd.print("Time Synced!");
+      delay(1000);
+    }
+    else
+    {
+      Serial.println("Invalid timestamp received");
+    }
+  }
+  else
+  {
+    Serial.printf("Time Sync Failed: %d\n", code);
+  }
+  http.end();
+}
+
 void sendData(SensorData &d)
 {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED)
+    return;
 
-  // Get Time
   DateTime now = rtc.now();
   char ts[25];
   sprintf(ts, "%04d-%02d-%02d %02d:%02d:%02d", now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
@@ -115,7 +163,6 @@ void sendData(SensorData &d)
   http.begin(u);
   http.addHeader("Content-Type", "application/json");
 
-  // JSON with Timestamp
   String j = "{\"ph\":" + String(d.ph, 2) + ",\"orp\":" + String(d.orp) +
              ",\"tds\":" + String(d.tds) + ",\"temp\":" + String(d.temp, 1) +
              ",\"timestamp\":\"" + String(ts) + "\"}";
@@ -126,7 +173,8 @@ void sendData(SensorData &d)
 
 int getCmd(int id)
 {
-  if (WiFi.status() != WL_CONNECTED) return -1;
+  if (WiFi.status() != WL_CONNECTED)
+    return -1;
   http.begin(String(api_url) + "/fetch/" + String(id) + "/state");
   http.setTimeout(150);
   int code = http.GET();
@@ -135,8 +183,10 @@ int getCmd(int id)
   {
     String p = http.getString();
     p.trim();
-    if (p == "1" || p == "ON")cmd = 1;
-    else if (p == "0" || p == "OFF")cmd = 0;
+    if (p == "1" || p == "ON")
+      cmd = 1;
+    else if (p == "0" || p == "OFF")
+      cmd = 0;
   }
   http.end();
   return cmd;
@@ -146,35 +196,25 @@ void setup()
 {
   Serial.begin(115200);
   Wire.begin();
-
-  // 1. Setup LCD
   lcd.init();
   lcd.backlight();
   lcd.setCursor(0, 0);
   lcd.print("System Init...");
-
-  // 2. Setup RTC
   if (!rtc.begin())
   {
-    Serial.println("RTC Missing");
     lcd.setCursor(0, 1);
     lcd.print("RTC Error!");
+    Serial.println("RTC Missing");
   }
-  if (rtc.lostPower())
-    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-
-  // 3. Setup Relays
   for (int i = 0; i < RELAY_CNT; i++)
   {
     pinMode(R_PINS[i], OUTPUT);
     digitalWrite(R_PINS[i], LOW);
-    last_r_state[i] = -1; // Init state unknown
+    last_r_state[i] = -1;
   }
-
   setupWiFi();
-
+  syncTime();
   lcd.clear();
-  lcd.setCursor(0, 0);
   lcd.print("Tuya Connect...");
   device = new TuyaDevice(tuya_id, tuya_ip, tuya_key, VER);
   device->connect();
@@ -192,24 +232,20 @@ void loop()
   if (showRelayMsg && (now - msgStartTime > MSG_DURATION))
   {
     showRelayMsg = false;
-    lcd.clear(); 
+    lcd.clear();
   }
 
   // === SENSOR TASK ===
   if (now - lastSensor >= T_SENSOR)
   {
     lastSensor = now;
-    bool success = device->fetchStatus();
-
-    if (success)
+    if (device->fetchStatus())
     {
       sendData(device->data);
 
       if (!showRelayMsg)
       {
-        // Layout:
-        // pH: 7.00 T:25.0
-        // ORP:750 TDS:120
+        // Real-time sensor display
         lcd.setCursor(0, 0);
         lcd.printf("pH:%.2f T:%.1f ", device->data.ph, device->data.temp);
         lcd.setCursor(0, 1);
@@ -223,6 +259,7 @@ void loop()
     }
   }
 
+  // === RELAY TASK ===
   if (now - lastRelay >= T_RELAY)
   {
     lastRelay = now;
@@ -236,11 +273,11 @@ void loop()
         {
           digitalWrite(R_PINS[i], cmd ? HIGH : LOW);
           last_r_state[i] = cmd;
+
+          // Show Popup on Change
           String s1 = "[RELAY CHANGE]";
           String s2 = "R" + String(R_IDS[i]) + " -> " + (cmd ? "ON" : "OFF");
           triggerLcdMsg(s1, s2);
-
-          Serial.printf("Relay %d set to %d\n", R_IDS[i], cmd);
         }
       }
     }
