@@ -1,132 +1,248 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiManager.h>
+#include <Preferences.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h> // Lib: LiquidCrystal_I2C
+#include <RTClib.h>            // Lib: RTClib (Adafruit)
 #include "TuyaDevice.h"
 
-// ===== CONFIGURATION =====
-const char* WIFI_SSID     = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+// ===== DEFAULTS =====
+char tuya_id[40] = "a3658e534d4fad4173ijbi";
+char tuya_key[40] = "jBM'#B$OGU/aN_Ud";
+char tuya_ip[20] = "192.168.223.41";
+char api_url[60] = "http://192.168.1.10:8000";
+const float VER = 3.3f;
 
-// Tuya Sensor Config
-const char* DEVICE_ID  = "a3658e534d4fad4173ijbi";
-const char* LOCAL_KEY  = "jBM'#B$OGU/aN_Ud";
-const char* TUYA_IP    = "192.168.223.41";
-const float VERSION    = 3.3f; //Versi Tuya (bisa diganti sampai 3.5)
+// ===== HARDWARE =====
+const int RELAY_CNT = 8;
+const int R_IDS[RELAY_CNT] = {2, 3, 4, 5, 6, 7, 8, 9};
+const int R_PINS[RELAY_CNT] = {27, 26, 25, 33, 19, 18, 17, 16};
 
-// API Config
-const char* API_BASE_URL = "http://192.168.1.10:8000"; 
-String API_SENSOR = "/submit-data";
+// Track relay states to detect changes for LCD
+int last_r_state[RELAY_CNT];
 
-// ===== HARDWARE MAPPING (FROM IMAGE) =====
-const int RELAY_COUNT = 8;
-
-// Mapping Relay dari PCB
-const int RELAY_IDS[RELAY_COUNT]  = {2,  3,  4,  5,  6,  7,  8,  9}; 
-const int RELAY_PINS[RELAY_COUNT] = {27, 26, 25, 33, 19, 18, 17, 16};
-
-// =========================
-
-unsigned long lastSensorTime = 0;
-unsigned long lastRelayTime = 0;
-const unsigned long SENSOR_INTERVAL = 250; 
-const unsigned long RELAY_INTERVAL  = 100;
-
-TuyaDevice device(DEVICE_ID, TUYA_IP, LOCAL_KEY, VERSION);
+// ===== OBJECTS =====
+TuyaDevice *device = nullptr;
 HTTPClient http;
+Preferences prefs;
+bool shouldSave = false;
+RTC_DS3231 rtc;
+LiquidCrystal_I2C lcd(0x27, 16, 2); // Address 0x27 is standard
 
-void sendSensorData(SensorData& data) {
-    if (WiFi.status() != WL_CONNECTED) return;
-    
-    String url = String(API_BASE_URL) + API_SENSOR;
-    http.begin(url);
-    http.addHeader("Content-Type", "application/json");
-    
-    String json = "{\"ph\":" + String(data.ph, 2) +
-                  ",\"orp\":" + String(data.orp) +
-                  ",\"tds\":" + String(data.tds) +
-                  ",\"temp\":" + String(data.temp, 1) +
-                  ",\"turbidity\":0}";
-    
-    int code = http.POST(json);
-    if (code > 0) {
-        Serial.printf("[API] Data sent (Code: %d)\n", code);
-    } else {
-        Serial.printf("[API] Send failed: %s\n", http.errorToString(code).c_str());
-    }
-    http.end();
+// ===== LCD STATE =====
+bool showRelayMsg = false;
+unsigned long msgStartTime = 0;
+const unsigned long MSG_DURATION = 3000; // Show relay msg for 3s
+String relayLine1 = "";
+String relayLine2 = "";
+
+// ===== TIMING =====
+unsigned long lastSensor = 0;
+unsigned long lastRelay = 0;
+const unsigned long T_SENSOR = 250;
+const unsigned long T_RELAY = 100;
+
+void saveCallback() { shouldSave = true; }
+
+void triggerLcdMsg(String l1, String l2)
+{
+  showRelayMsg = true;
+  msgStartTime = millis();
+  relayLine1 = l1;
+  relayLine2 = l2;
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(l1);
+  lcd.setCursor(0, 1);
+  lcd.print(l2);
 }
 
-int getRelayCommand(int relayId) {
-    if (WiFi.status() != WL_CONNECTED) return -1;
+void setupWiFi()
+{
+  WiFiManager wm;
+  wm.setSaveConfigCallback(saveCallback);
 
-    String url = String(API_BASE_URL) + "/fetch/" + String(relayId) + "/state";
-    
-    http.begin(url);
-    int httpCode = http.GET();
-    int command = -1;
-    
-    if (httpCode == 200) {
-        String payload = http.getString();
-        payload.trim(); 
-        if (payload == "1" || payload == "true" || payload == "ON") command = 1;
-        else if (payload == "0" || payload == "false" || payload == "OFF") command = 0;
-    } else {
-        Serial.printf("[API] Relay %d fetch failed (Code: %d)\n", relayId, httpCode);
-    }
-    http.end();
-    return command;
+  prefs.begin("tuya_cfg", false);
+  String s_id = prefs.getString("id", tuya_id);
+  String s_key = prefs.getString("key", tuya_key);
+  String s_ip = prefs.getString("ip", tuya_ip);
+  String s_url = prefs.getString("url", api_url);
+
+  s_id.toCharArray(tuya_id, 40);
+  s_key.toCharArray(tuya_key, 40);
+  s_ip.toCharArray(tuya_ip, 20);
+  s_url.toCharArray(api_url, 60);
+
+  WiFiManagerParameter p_id("id", "Device ID", tuya_id, 40);
+  WiFiManagerParameter p_key("key", "Local Key", tuya_key, 40);
+  WiFiManagerParameter p_ip("ip", "Tuya IP", tuya_ip, 20);
+  WiFiManagerParameter p_url("url", "API URL", api_url, 60);
+
+  wm.addParameter(&p_id);
+  wm.addParameter(&p_key);
+  wm.addParameter(&p_ip);
+  wm.addParameter(&p_url);
+
+  if (!wm.autoConnect("ESP32_Config"))
+    ESP.restart();
+
+  if (shouldSave)
+  {
+    strcpy(tuya_id, p_id.getValue());
+    strcpy(tuya_key, p_key.getValue());
+    strcpy(tuya_ip, p_ip.getValue());
+    strcpy(api_url, p_url.getValue());
+    prefs.putString("id", tuya_id);
+    prefs.putString("key", tuya_key);
+    prefs.putString("ip", tuya_ip);
+    prefs.putString("url", api_url);
+    prefs.end();
+  }
 }
 
-void setup() {
-    Serial.begin(115200);    
-    Serial.println("Initializing Relays...");
-    for (int i = 0; i < RELAY_COUNT; i++) {
-        pinMode(RELAY_PINS[i], OUTPUT);
-        digitalWrite(RELAY_PINS[i], LOW); 
-        Serial.printf(" - Mapped Relay ID %d to GPIO %d\n", RELAY_IDS[i], RELAY_PINS[i]);
-    }
+void sendData(SensorData &d)
+{
+  if (WiFi.status() != WL_CONNECTED) return;
 
-    Serial.printf("Connecting to %s", WIFI_SSID);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-    Serial.println("\nWiFi Connected!");
+  // Get Time
+  DateTime now = rtc.now();
+  char ts[25];
+  sprintf(ts, "%04d-%02d-%02d %02d:%02d:%02d", now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
 
-    Serial.println("Connecting to Tuya Sensor...");
-    device.connect();
+  String u = String(api_url) + "/submit-data";
+  http.begin(u);
+  http.addHeader("Content-Type", "application/json");
+
+  // JSON with Timestamp
+  String j = "{\"ph\":" + String(d.ph, 2) + ",\"orp\":" + String(d.orp) +
+             ",\"tds\":" + String(d.tds) + ",\"temp\":" + String(d.temp, 1) +
+             ",\"timestamp\":\"" + String(ts) + "\"}";
+
+  http.POST(j);
+  http.end();
 }
 
-void loop() {
-    unsigned long currentMillis = millis();
-    if (currentMillis - lastSensorTime >= SENSOR_INTERVAL) {
-        lastSensorTime = currentMillis;
+int getCmd(int id)
+{
+  if (WiFi.status() != WL_CONNECTED) return -1;
+  http.begin(String(api_url) + "/fetch/" + String(id) + "/state");
+  http.setTimeout(150);
+  int code = http.GET();
+  int cmd = -1;
+  if (code == 200)
+  {
+    String p = http.getString();
+    p.trim();
+    if (p == "1" || p == "ON")cmd = 1;
+    else if (p == "0" || p == "OFF")cmd = 0;
+  }
+  http.end();
+  return cmd;
+}
 
-        if (device.fetchStatus()) {
-            Serial.printf("[Sensor] pH: %.2f | ORP: %d | TDS: %d | Temp: %.1f\n",
-                device.data.ph, device.data.orp, device.data.tds, device.data.temp);
-            sendSensorData(device.data);
-        } else {
-            Serial.println("[Sensor] Read failed. Attempting reconnect...");
-            device.disconnect();
-            device.connect(); 
+void setup()
+{
+  Serial.begin(115200);
+  Wire.begin();
+
+  // 1. Setup LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("System Init...");
+
+  // 2. Setup RTC
+  if (!rtc.begin())
+  {
+    Serial.println("RTC Missing");
+    lcd.setCursor(0, 1);
+    lcd.print("RTC Error!");
+  }
+  if (rtc.lostPower())
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+
+  // 3. Setup Relays
+  for (int i = 0; i < RELAY_CNT; i++)
+  {
+    pinMode(R_PINS[i], OUTPUT);
+    digitalWrite(R_PINS[i], LOW);
+    last_r_state[i] = -1; // Init state unknown
+  }
+
+  setupWiFi();
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Tuya Connect...");
+  device = new TuyaDevice(tuya_id, tuya_ip, tuya_key, VER);
+  device->connect();
+
+  lcd.clear();
+}
+
+void loop()
+{
+  if (!device)
+    return;
+  unsigned long now = millis();
+
+  // === LCD RESTORE LOGIC ===
+  if (showRelayMsg && (now - msgStartTime > MSG_DURATION))
+  {
+    showRelayMsg = false;
+    lcd.clear(); 
+  }
+
+  // === SENSOR TASK ===
+  if (now - lastSensor >= T_SENSOR)
+  {
+    lastSensor = now;
+    bool success = device->fetchStatus();
+
+    if (success)
+    {
+      sendData(device->data);
+
+      if (!showRelayMsg)
+      {
+        // Layout:
+        // pH: 7.00 T:25.0
+        // ORP:750 TDS:120
+        lcd.setCursor(0, 0);
+        lcd.printf("pH:%.2f T:%.1f ", device->data.ph, device->data.temp);
+        lcd.setCursor(0, 1);
+        lcd.printf("ORP:%d TDS:%d ", device->data.orp, device->data.tds);
+      }
+    }
+    else
+    {
+      device->disconnect();
+      device->connect();
+    }
+  }
+
+  if (now - lastRelay >= T_RELAY)
+  {
+    lastRelay = now;
+    for (int i = 0; i < RELAY_CNT; i++)
+    {
+      int cmd = getCmd(R_IDS[i]);
+
+      if (cmd != -1)
+      {
+        if (cmd != last_r_state[i])
+        {
+          digitalWrite(R_PINS[i], cmd ? HIGH : LOW);
+          last_r_state[i] = cmd;
+          String s1 = "[RELAY CHANGE]";
+          String s2 = "R" + String(R_IDS[i]) + " -> " + (cmd ? "ON" : "OFF");
+          triggerLcdMsg(s1, s2);
+
+          Serial.printf("Relay %d set to %d\n", R_IDS[i], cmd);
         }
+      }
     }
-
-    if (currentMillis - lastRelayTime >= RELAY_INTERVAL) {
-        lastRelayTime = currentMillis;
-
-        for (int i = 0; i < RELAY_COUNT; i++) {
-            int targetId = RELAY_IDS[i];
-            int targetPin = RELAY_PINS[i];
-
-            int command = getRelayCommand(targetId);
-            
-            if (command != -1) {
-                digitalWrite(targetPin, command == 1 ? HIGH : LOW);
-                Serial.printf("[Relay %d] Set to %s\n", targetId, command == 1 ? "ON" : "OFF");
-            }
-        }
-    }
+  }
 }
